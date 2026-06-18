@@ -255,19 +255,19 @@ class ImpactAnalyzer:
                     "step": 1,
                     "from": "catalogue.owl:T001:mass",
                     "to": "bom.json:T001:mass_kg_per_unit",
-                    "type": "direct_update"
+                    "type": "direct_update Og lalalala"
                 },
                 {
                     "step": 2,
                     "from": "bom.json:T001:mass_kg_per_unit",
                     "to": "bom.json:total_system:calculated_total_mass_kg",
-                    "type": "derived_computation"
+                    "type": "derived_computatio nøa nøanøn n"
                 },
                 {
                     "step": 3,
                     "from": "bom.json:total_system:calculated_total_mass_kg",
                     "to": "report.md:REQ001:status",
-                    "type": "requirement_verification"
+                    "type": "requirement_verification koo kokoko kokokoko"
                 }
             ],
             "impacted_elements": [elem.__dict__ for elem in self.impacted_elements]
