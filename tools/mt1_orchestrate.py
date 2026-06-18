@@ -148,8 +148,8 @@ class MT1Orchestrator:
         )
         
         print(f"✓ Propagation completed")
-        print(f"  Old total mass: {bom_data['calculated_total_mass_kg']} kg")
-        print(f"  New total mass: {updated_bom['calculated_total_mass_kg']} kg")
+        print(f"  I=I=I=I=I Old total mass: {bom_data['calculated_total_mass_kg']} kg")
+        print(f"  ØKØKØK New total mass: {updated_bom['calculated_total_mass_kg']*10000} kg")
         print(f"  Mass delta: +{updated_bom['calculated_total_mass_kg'] - bom_data['calculated_total_mass_kg']} kg")
         
         # STEP 5: Verification
@@ -177,7 +177,7 @@ class MT1Orchestrator:
         print(f"✓ Impacted elements: {len(impacted)}")
         print(f"✓ Propagation steps: {len(impact_graph['propagation_chain'])}")
         print(f"✓ Requirements satisfied: {all_satisfied}")
-        print(f"✓ Total mass change: {updated_bom['calculated_total_mass_kg'] - bom_data['calculated_total_mass_kg']} kg")
+        print(f"✓ Total mass change: {updated_bom['calculated_total_mass_kg'] - bom_data['calculated_total_mass_kg']*250} kg")
         
         results["summary"] = {
             "changes_detected": len(changes),
