@@ -1,233 +1,244 @@
 #!/usr/bin/env python3
 """
-Integration script for MT.1 Change Impact & Reconciliation.
+Command line entry point for MT.1 Change Impact & Reconciliation.
 
-This script demonstrates the complete workflow:
-1. Detect changes between v1 and v2 catalogues
-2. Analyze impact across models
-3. Execute propagation and verification
-4. Generate impact report
+    diff      OLD NEW          detect changes between two snapshots and print the impact graph
+    check     DIR [DIR ...]    exit 1 if any derived artefact is out of sync with its sources
+    propagate DIR              reconcile a snapshot (BOM, XML mirrors, report) using a strategy
+    run       OLD NEW          full MT.1 workflow: diff + impact analysis + propagation + verification
+
+Examples:
+    python3 tools/mt1_orchestrate.py diff v1 v2 --granularity model
+    python3 tools/mt1_orchestrate.py check v1 v2
+    python3 tools/mt1_orchestrate.py propagate v2 --baseline v1 --strategy automatic
 """
 
+import argparse
 import json
-import csv
-from pathlib import Path
-from typing import Dict, List, Tuple
 import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
+from artefacts import load_snapshot, Snapshot
 from mt1_change_impact import (
     ChangeDetector,
-    ImpactAnalyzer,
-    PropagationEngine,
-    PropagationStrategy,
     GranularityLevel,
+    ImpactAnalyzer,
+    ImpactGraph,
+    PropagationEngine,
+    PropagationResult,
+    PropagationStrategy,
 )
 
 
-class MT1Orchestrator:
-    """Orchestrates MT.1 change impact and reconciliation workflow."""
-    
-    def __init__(self, repo_root: str):
-        """Initialize orchestrator with repository root path."""
-        self.repo_root = Path(repo_root)
-        self.v1_dir = self.repo_root / "v1"
-        self.v2_dir = self.repo_root / "v2"
-    
-    def run_workflow(self, strategy: PropagationStrategy = PropagationStrategy.SEMI_AUTOMATIC) -> Dict:
-        """
-        Execute complete MT.1 workflow.
-        
-        Args:
-            strategy: Propagation strategy to use
-            
-        Returns:
-            Dictionary containing workflow results
-        """
-        results = {
-            "workflow": "MT.1 -- Change Impact & Reconciliation",
-            "strategy": strategy.value,
-            "steps": {}
-        }
-        
-        # STEP 1: Change Detection
-        print("\n" + "="*70)
-        print("STEP 1: CHANGE DETECTION")
-        print("="*70)
-        
-        catalogue_v1 = self.v1_dir / "manufacturer" / "catalogue.owl"
-        catalogue_v2 = self.v2_dir / "manufacturer" / "catalogue.owl"
-        
-        detector = ChangeDetector()
-        changes = detector.detect_owl_changes(str(catalogue_v1), str(catalogue_v2))
-        
-        changes_summary = []
-        for change in changes:
-            summary = {
-                "component": change.component_id,
-                "attribute": change.attribute,
-                "old_value": change.old_value,
-                "new_value": change.new_value,
-                "hash": change.change_hash
-            }
-            changes_summary.append(summary)
-            print(f"✓ Detected: {change.component_id}.{change.attribute}: {change.old_value} → {change.new_value}")
-        
-        results["steps"]["detection"] = {
-            "detected_changes": len(changes),
-            "details": changes_summary
-        }
-        
-        # STEP 2: Impact Analysis
-        print("\n" + "="*70)
-        print("STEP 2: IMPACT ANALYSIS")
-        print("="*70)
-        
-        bom_v1_file = self.v1_dir / "systems_engineer" / "bom.json"
-        analyzer = ImpactAnalyzer(
-            str(bom_v1_file),
-            str(self.v1_dir / "requirements_engineer" / "requirements.csv"),
-            str(self.v1_dir / "verification_engineer" / "report.md")
-        )
-        
-        impacted = analyzer.analyze_impact(changes, GranularityLevel.ELEMENT)
-        
-        impacted_summary = []
-        for elem in impacted:
-            print(f"✓ Impacted: {elem.model_file}:{elem.element_id}:{elem.attribute} ({elem.granularity.value})")
-            impacted_summary.append({
-                "model": elem.model_file,
-                "element": elem.element_id,
-                "attribute": elem.attribute,
-                "granularity": elem.granularity.value
-            })
-        
-        results["steps"]["impact_analysis"] = {
-            "impacted_count": len(impacted),
-            "details": impacted_summary
-        }
-        
-        # STEP 3: Impact Structure
-        print("\n" + "="*70)
-        print("STEP 3: DEPENDENCY GRAPH")
-        print("="*70)
-        
-        impact_graph = analyzer.build_impact_structure()
-        
-        print(f"✓ Source: {impact_graph['source']['model']}:{impact_graph['source']['element']}:{impact_graph['source']['attribute']}")
-        print(f"✓ Propagation chain ({len(impact_graph['propagation_chain'])} steps):")
-        
-        for step in impact_graph['propagation_chain']:
-            print(f"  └─ Step {step['step']}: {step['from']} → {step['to']}")
-            print(f"     Type: {step['type']}")
-        
-        results["steps"]["dependency_graph"] = impact_graph
-        
-        # STEP 4: Change Propagation
-        print("\n" + "="*70)
-        print("STEP 4: CHANGE PROPAGATION")
-        print("="*70)
-        
-        print(f"✓ Strategy: {strategy.value}")
-        
-        # Load v1 BOM for reference
-        with open(bom_v1_file, 'r') as f:
-            bom_data = json.load(f)
-        
-        # Load requirements
-        requirements_data = []
-        with open(self.v1_dir / "requirements_engineer" / "requirements.csv", 'r') as f:
-            reader = csv.DictReader(f)
-            requirements_data = list(reader)
-        
-        # Execute propagation
-        propagation_engine = PropagationEngine(strategy)
-        updated_bom, _, all_satisfied = propagation_engine.propagate_changes(
-            changes,
-            bom_data,
-            requirements_data
-        )
-        
-        print(f"✓ Propagation completed")
-        print(f"  I=I=I=I=I Old total mass: {bom_data['calculated_total_mass_kg']} kg")
-        print(f"  ØKØKØK New total mass: {updated_bom['calculated_total_mass_kg']*10000} kg")
-        print(f"  Mass delta: +{updated_bom['calculated_total_mass_kg'] - bom_data['calculated_total_mass_kg']} kg")
-        
-        # STEP 5: Verification
-        print("\n" + "="*70)
-        print("STEP 5: REQUIREMENT VERIFICATION")
-        print("="*70)
-        
-        for log_entry in propagation_engine.propagation_log:
-            if log_entry.get('action') == 'verify':
-                status = "✓ SATISFIED" if log_entry['satisfied'] else "✗ NOT SATISFIED"
-                print(f"{status}: {log_entry['requirement']}")
-                print(f"  Actual: {log_entry['actual_value']} kg, Threshold: ≤ {log_entry['threshold']} kg")
-        
-        results["steps"]["verification"] = {
-            "all_satisfied": all_satisfied,
-            "logs": propagation_engine.propagation_log
-        }
-        
-        # STEP 6: Impact Summary
-        print("\n" + "="*70)
-        print("STEP 6: SUMMARY")
-        print("="*70)
-        
-        print(f"✓ Changes detected: {len(changes)}")
-        print(f"✓ Impacted elements: {len(impacted)}")
-        print(f"✓ Propagation steps: {len(impact_graph['propagation_chain'])}")
-        print(f"✓ Requirements satisfied: {all_satisfied}")
-        print(f"✓ Total mass change: {updated_bom['calculated_total_mass_kg'] - bom_data['calculated_total_mass_kg']*250} kg")
-        
-        results["summary"] = {
-            "changes_detected": len(changes),
-            "elements_impacted": len(impacted),
-            "propagation_steps": len(impact_graph['propagation_chain']),
-            "requirements_satisfied": all_satisfied,
-            "mass_delta": updated_bom['calculated_total_mass_kg'] - bom_data['calculated_total_mass_kg'],
-            "updated_total_mass": updated_bom['calculated_total_mass_kg']
-        }
-        
-        return results
+def _fmt(value: Any) -> str:
+    return json.dumps(value) if isinstance(value, (dict, list)) else str(value)
 
 
-def main():
-    """Main entry point."""
-    if len(sys.argv) < 2:
-        print("Usage: python mt1_orchestrate.py <repo_root> [--strategy automatic|semi-automatic|manual]")
-        print("\nExample:")
-        print("  python mt1_orchestrate.py . --strategy semi-automatic")
-        sys.exit(1)
-    
-    repo_root = sys.argv[1]
-    strategy = PropagationStrategy.SEMI_AUTOMATIC
-    
-    if len(sys.argv) > 3 and sys.argv[2] == "--strategy":
-        strategy_str = sys.argv[3]
-        if strategy_str == "automatic":
-            strategy = PropagationStrategy.AUTOMATIC
-        elif strategy_str == "manual":
-            strategy = PropagationStrategy.MANUAL
-    
-    print("\n" + "="*70)
-    print("MT.1 -- CHANGE IMPACT & RECONCILIATION WORKFLOW")
-    print("="*70)
-    
-    orchestrator = MT1Orchestrator(repo_root)
-    results = orchestrator.run_workflow(strategy)
-    
-    # Save results to JSON
-    output_file = Path(repo_root) / "mt1_results.json"
-    with open(output_file, 'w') as f:
-        json.dump(results, f, indent=2)
-    
-    print(f"\n✓ Results saved to: {output_file}")
-    print("\n" + "="*70)
-    print("WORKFLOW COMPLETE")
-    print("="*70)
-    
-    return results
+def _section(title: str):
+    print("\n" + "=" * 70)
+    print(title)
+    print("=" * 70)
+
+
+class Summary:
+    """Collects Markdown for $GITHUB_STEP_SUMMARY or a PR comment."""
+
+    def __init__(self, path: Optional[str]):
+        self.path = path
+        self.lines: List[str] = []
+
+    def add(self, *lines: str):
+        self.lines.extend(lines)
+
+    def write(self):
+        if self.path:
+            with open(self.path, "a") as f:
+                f.write("\n".join(self.lines) + "\n\n")
+
+
+# ---------------------------------------------------------------------------
+# Steps
+# ---------------------------------------------------------------------------
+
+def run_diff(old: Snapshot, new: Snapshot, granularity: GranularityLevel, summary: Summary) -> Dict[str, Any]:
+    _section(f"CHANGE DETECTION: {old.root} -> {new.root}")
+    changes = ChangeDetector().detect(old, new)
+    for c in changes:
+        print(f"  [{c.change_hash}] {c.kind.value:8} {c.node}: {_fmt(c.old_value)} -> {_fmt(c.new_value)}")
+    if not changes:
+        print("  No changes detected.")
+
+    _section(f"IMPACT GRAPH ({granularity.value} level)")
+    graph: ImpactGraph = ImpactAnalyzer(new).analyze(changes)
+    view = graph.coarsened(granularity)
+    for change in changes:
+        print(f"  [{change.change_hash}] {change.node}")
+        for path in graph.paths_from(change.node):
+            if len(path) > 1:
+                print("     " + " -> ".join(path[1:]))
+    impacted = sorted({target for _, target, _ in view.edges})
+    print(f"\n  Impacted {granularity.value}s ({len(impacted)}):")
+    for node in impacted:
+        print(f"   - {node}  (caused by {len(view.nodes[node])} change(s))")
+
+    title = f"Changes in {new.name}" if old.name == new.name else f"Changes {old.name} → {new.name}"
+    summary.add(f"### {title}", "")
+    if changes:
+        summary.add("| Hash | Kind | Element | Old | New |", "|---|---|---|---|---|")
+        summary.add(*[f"| `{c.change_hash}` | {c.kind.value} | `{c.node}` | {_fmt(c.old_value)} | {_fmt(c.new_value)} |"
+                      for c in changes])
+        summary.add("", f"**Impacted {granularity.value}s:** " + (", ".join(f"`{n}`" for n in impacted) or "none"), "")
+    else:
+        summary.add("No changes.", "")
+
+    return {"changes": [c.to_dict() for c in changes], "impact_graph": graph.to_dict(),
+            "impacted": impacted, "granularity": granularity.value}
+
+
+def print_propagation(snapshot: Snapshot, result: PropagationResult, summary: Summary, written: List[str]):
+    _section(f"RECONCILIATION: {snapshot.root} (strategy: {result.strategy.value})")
+    for u in result.updates:
+        state = "applied" if u.applied else "PENDING"
+        kind = "structural" if u.structural else u.granularity.value
+        print(f"  [{state:7}] {u.artefact}:{u.element}:{u.attribute or '*'} "
+              f"{_fmt(u.old_value)} -> {_fmt(u.new_value)}  ({kind}; {u.reason})")
+    if result.consistent:
+        print("  All derived artefacts are consistent with their sources.")
+    for e in result.errors:
+        print(f"  ERROR: {e}")
+    for path in written:
+        print(f"  wrote {snapshot.root / path}")
+
+    _section(f"REQUIREMENT VERIFICATION: {snapshot.root}")
+    for v in result.verification:
+        status = {True: "SATISFIED", False: "NOT SATISFIED", None: "UNKNOWN"}[v["satisfied"]]
+        print(f"  {v['requirement']}: {status} ({v['parameter']} = {v['actual']} {v['unit']}, "
+              f"constraint {v['operator']} {v['threshold']})")
+
+    if result.consistent:
+        status = "✅ consistent"
+    else:
+        applied = len(result.updates) - len(result.pending)
+        status = ", ".join(part for part in (
+            f"🔄 {applied} update(s) applied" if applied else "",
+            f"⚠️ {len(result.pending)} pending" if result.pending else "",
+            f"❌ {len(result.errors)} error(s)" if result.errors else "",
+        ) if part)
+    summary.add(f"### {snapshot.name}: {status}", "")
+    if result.updates:
+        summary.add("| State | Element | Old | New | Reason |", "|---|---|---|---|---|")
+        summary.add(*[f"| {'applied' if u.applied else 'pending'} | `{u.artefact}:{u.element}:{u.attribute or '*'}` "
+                      f"| {_fmt(u.old_value)} | {_fmt(u.new_value)} | {u.reason} |" for u in result.updates])
+        summary.add("")
+    summary.add(*[f"- ❌ {e}" for e in result.errors])
+    summary.add(*[f"- {'✅' if v['satisfied'] else '❌'} **{v['requirement']}** {v['parameter']} = {v['actual']} "
+                  f"{v['unit']} ({v['operator']} {v['threshold']})" for v in result.verification], "")
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_diff(args, summary: Summary) -> int:
+    results = run_diff(load_snapshot(args.old), load_snapshot(args.new), GranularityLevel(args.granularity), summary)
+    _write_json(args.json, results)
+    return 0
+
+
+def cmd_check(args, summary: Summary) -> int:
+    baseline = load_snapshot(args.baseline) if args.baseline else None
+    exit_code = 0
+    results = {}
+    for directory in args.dirs:
+        snapshot = load_snapshot(directory)
+        result = PropagationEngine(PropagationStrategy.MANUAL).reconcile(snapshot, baseline)
+        print_propagation(snapshot, result, summary, [])
+        results[str(directory)] = result.to_dict()
+        if not result.consistent or (args.fail_on_violation and not result.all_satisfied):
+            exit_code = 1
+    _write_json(args.json, results)
+    print("\nCHECK " + ("PASSED" if exit_code == 0 else "FAILED: run `propagate` to reconcile"))
+    return exit_code
+
+
+def cmd_propagate(args, summary: Summary) -> int:
+    snapshot = load_snapshot(args.dir)
+    baseline = load_snapshot(args.baseline) if args.baseline else None
+    engine = PropagationEngine(PropagationStrategy(args.strategy))
+    result = engine.reconcile(snapshot, baseline)
+    written = engine.apply(snapshot, result)
+    print_propagation(snapshot, result, summary, written)
+    _write_json(args.json, result.to_dict())
+    if result.errors or (args.fail_on_violation and not result.all_satisfied):
+        return 1
+    return 0
+
+
+def cmd_run(args, summary: Summary) -> int:
+    old, new = load_snapshot(args.old), load_snapshot(args.new)
+    results: Dict[str, Any] = {"workflow": "MT.1 -- Change Impact & Reconciliation", "strategy": args.strategy}
+    results.update(run_diff(old, new, GranularityLevel(args.granularity), summary))
+    engine = PropagationEngine(PropagationStrategy(args.strategy))
+    result = engine.reconcile(new, old)
+    written = engine.apply(new, result)
+    print_propagation(new, result, summary, written)
+    results["propagation"] = result.to_dict()
+    results["written"] = written
+    _write_json(args.json, results)
+    return 1 if result.errors else 0
+
+
+def _write_json(path: Optional[str], data: Dict[str, Any]):
+    if path:
+        Path(path).write_text(json.dumps(data, indent=2, default=str) + "\n")
+        print(f"\nResults saved to: {path}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--json", help="write machine-readable results to this file")
+    parser.add_argument("--summary", help="append a Markdown summary to this file (e.g. $GITHUB_STEP_SUMMARY)")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    strategies = [s.value for s in PropagationStrategy]
+    granularities = [g.value for g in GranularityLevel]
+
+    p = sub.add_parser("diff", help="detect changes between two snapshots")
+    p.add_argument("old", type=Path)
+    p.add_argument("new", type=Path)
+    p.add_argument("--granularity", choices=granularities, default="element")
+    p.set_defaults(func=cmd_diff)
+
+    p = sub.add_parser("check", help="verify that derived artefacts are in sync")
+    p.add_argument("dirs", type=Path, nargs="+")
+    p.add_argument("--baseline", type=Path)
+    p.add_argument("--fail-on-violation", action="store_true", help="also fail when a requirement is violated")
+    p.set_defaults(func=cmd_check)
+
+    p = sub.add_parser("propagate", help="reconcile one snapshot")
+    p.add_argument("dir", type=Path)
+    p.add_argument("--baseline", type=Path, help="previous snapshot, used to detect removed comms components")
+    p.add_argument("--strategy", choices=strategies, default="semi-automatic")
+    p.add_argument("--fail-on-violation", action="store_true")
+    p.set_defaults(func=cmd_propagate)
+
+    p = sub.add_parser("run", help="full MT.1 workflow from OLD to NEW")
+    p.add_argument("old", type=Path)
+    p.add_argument("new", type=Path)
+    p.add_argument("--strategy", choices=strategies, default="semi-automatic")
+    p.add_argument("--granularity", choices=granularities, default="element")
+    p.set_defaults(func=cmd_run)
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    summary = Summary(args.summary)
+    code = args.func(args, summary)
+    summary.write()
+    return code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

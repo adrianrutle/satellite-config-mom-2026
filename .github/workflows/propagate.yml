@@ -1,0 +1,88 @@
+name: Propagate changes
+
+# CD for the artefacts: when a source artefact (catalogue, network, requirements)
+# changes on main, detect the change against the previous commit, propagate it to
+# the BOM, the XML mirrors and the report, and open a pull request with the result.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "v*/**"
+      - "tools/**"
+  workflow_dispatch:
+    inputs:
+      strategy:
+        description: Propagation strategy
+        type: choice
+        options: [automatic, semi-automatic]
+        default: automatic
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: propagate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  propagate:
+    runs-on: ubuntu-latest
+    env:
+      STRATEGY: ${{ inputs.strategy || 'automatic' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check out previous revision
+        id: before
+        run: |
+          BEFORE="${{ github.event.before }}"
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            BEFORE="$(git rev-parse HEAD~1 2>/dev/null || true)"
+          fi
+          if [ -n "$BEFORE" ] && git worktree add --detach "$RUNNER_TEMP/before" "$BEFORE"; then
+            echo "dir=$RUNNER_TEMP/before" >> "$GITHUB_OUTPUT"
+            echo "sha=$BEFORE" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Detect, analyse and propagate
+        env:
+          BEFORE_DIR: ${{ steps.before.outputs.dir }}
+          SUMMARY: ${{ runner.temp }}/summary.md
+          RESULTS: ${{ runner.temp }}/results
+        run: |
+          mkdir -p "$RESULTS"
+          echo "## MT.1 propagation (strategy: \`$STRATEGY\`)" > "$SUMMARY"
+          for v in v*/; do
+            v="${v%/}"
+            baseline=()
+            if [ -n "$BEFORE_DIR" ] && [ -d "$BEFORE_DIR/$v" ]; then
+              python tools/mt1_orchestrate.py --summary "$SUMMARY" --json "$RESULTS/$v-diff.json" \
+                diff "$BEFORE_DIR/$v" "$v"
+              baseline=(--baseline "$BEFORE_DIR/$v")
+            fi
+            python tools/mt1_orchestrate.py --summary "$SUMMARY" --json "$RESULTS/$v-propagation.json" \
+              propagate "$v" --strategy "$STRATEGY" "${baseline[@]}"
+          done
+          cat "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mt1-results
+          path: ${{ runner.temp }}/results
+
+      - name: Open pull request with propagated artefacts
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: mom/propagate-${{ github.ref_name }}
+          delete-branch: true
+          add-paths: v*
+          commit-message: "chore(mom): propagate artefact changes from ${{ github.sha }}"
+          title: "Propagate artefact changes (${{ env.STRATEGY }})"
+          body-path: ${{ runner.temp }}/summary.md

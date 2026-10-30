@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run tests
+        working-directory: tools
+        run: python -m unittest -v test_mt1
+
+  consistency:
+    name: Artefact consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Impact of this pull request
+        if: github.event_name == 'pull_request'
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/base" "${{ github.event.pull_request.base.sha }}"
+          echo "## Change impact against \`${{ github.base_ref }}\`" >> "$GITHUB_STEP_SUMMARY"
+          for v in v*/; do
+            v="${v%/}"
+            if [ -d "$RUNNER_TEMP/base/$v" ]; then
+              python tools/mt1_orchestrate.py --summary "$GITHUB_STEP_SUMMARY" \
+                diff "$RUNNER_TEMP/base/$v" "$v"
+            fi
+          done
+
+      - name: Check that derived artefacts are in sync
+        id: check
+        run: |
+          echo "## Consistency check" >> "$GITHUB_STEP_SUMMARY"
+          python tools/mt1_orchestrate.py --summary "$GITHUB_STEP_SUMMARY" check v*/
+
+      - name: Propose reconciliation
+        if: failure() && steps.check.outcome == 'failure'
+        run: |
+          for v in v*/; do
+            python tools/mt1_orchestrate.py propagate "${v%/}" --strategy automatic || true
+          done
+          git diff > "$RUNNER_TEMP/reconciliation.patch"
+          {
+            echo "## Proposed reconciliation"
+            echo "Run \`python tools/mt1_orchestrate.py propagate <dir> --strategy automatic\` locally, or apply the patch artifact:"
+            echo '```diff'
+            cat "$RUNNER_TEMP/reconciliation.patch"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: failure() && steps.check.outcome == 'failure'
+        with:
+          name: reconciliation-patch
+          path: ${{ runner.temp }}/reconciliation.patch

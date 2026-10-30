@@ -76,6 +76,10 @@ v2/
   - **MT.2**: The communications team adds a backup antenna (`ANT002`) in the Network Topology. This is reflected in the Bill of Materials.
   - As a result, the total system mass becomes 357.0 kg and `REQ001` is **NOT SATISFIED**. `v2` therefore represents a *broken state* that challenge participants must reason about.
 
+### Tooling and CI
+
+`tools/` contains a reference implementation of MT.1 (change detection, impact analysis and propagation); see [tools/README.md](tools/README.md). GitHub Actions run its tests on every push and pull request, and check that the derived artefacts (BOM total, XML mirrors and report) agree with their sources. On `main`, a second workflow propagates changes to source artefacts and opens a pull request with the regenerated artefacts.
+
 ### Model Management Scenarios
 
 We define three Engineering Scenarios (ES) that are encountered during the design of the hypothetical satellite system.

@@ -5,405 +5,479 @@ MT.1 -- Change Impact & Reconciliation
 This module implements change detection, impact analysis, and propagation
 for the satellite configuration model management challenge.
 
-The task addresses ES.1 where a manufacturer updates the thruster mass
-in the Parts Catalogue, which must be propagated to the Bill of Materials and Report.
+- ChangeDetector compares two snapshots (e.g. v1/ and v2/) element by element.
+- ImpactAnalyzer traces each change through the traceability rules between
+  artefacts and builds an explicit, composable impact graph.
+- PropagationEngine reconciles one snapshot: it recomputes everything that is
+  derived from the source artefacts and applies it according to a strategy.
+
+Traceability rules (source -> target):
+    catalogue.owl:<id>:mass          -> bom.json:<id>:mass_kg_per_unit
+    comm-network.json:<node>         -> bom.json:<type>:quantity     (view -> source model)
+    comm-network.json                -> comm-network.xml              (representation)
+    bom.json:<id>:*                  -> bom.json:calculated_total_mass_kg
+    bom.json                         -> bom.xml                       (representation)
+    bom.json:<parameter>             -> report.md:<req>:status        (for requirements on <parameter>)
+    requirements.csv:<req>           -> report.md:<req>:status
 """
 
-import json
-import xml.etree.ElementTree as ET
-from typing import Dict, List, Tuple, Optional, Any
-from dataclasses import dataclass
-from enum import Enum
 import hashlib
+from collections import Counter, deque
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+import artefacts as A
+from artefacts import Snapshot
+
+CATALOGUE = "catalogue.owl"
+BOM = "bom.json"
+BOM_XML = "bom.xml"
+NETWORK = "comm-network.json"
+NETWORK_XML = "comm-network.xml"
+REQUIREMENTS = "requirements.csv"
+REPORT = "report.md"
+TOTAL = "calculated_total_mass_kg"
 
 
 class PropagationStrategy(Enum):
     """Propagation strategies for change management."""
-    MANUAL = "manual"
-    SEMI_AUTOMATIC = "semi-automatic"
-    AUTOMATIC = "automatic"
+    MANUAL = "manual"                  # compute the plan only, change nothing
+    SEMI_AUTOMATIC = "semi-automatic"  # apply value updates, leave structural edits for review
+    AUTOMATIC = "automatic"            # apply every update
 
 
 class GranularityLevel(Enum):
     """Granularity levels for change propagation."""
-    ELEMENT = "element"
-    FEATURE = "feature"
-    MODEL = "model"
+    ELEMENT = "element"  # artefact:element:attribute
+    FEATURE = "feature"  # artefact:attribute (across elements)
+    MODEL = "model"      # artefact
+
+
+class ChangeKind(Enum):
+    ADDED = "added"
+    REMOVED = "removed"
+    MODIFIED = "modified"
+
+
+def node_id(artefact: str, element: str, attribute: str = "") -> str:
+    return f"{artefact}:{element}:{attribute}" if attribute else f"{artefact}:{element}"
+
+
+def coarsen(node: str, granularity: GranularityLevel) -> str:
+    """Map an element-level node id to the requested granularity."""
+    parts = node.split(":")
+    if granularity == GranularityLevel.MODEL:
+        return parts[0]
+    if granularity == GranularityLevel.FEATURE:
+        return f"{parts[0]}:{parts[-1] if len(parts) > 2 else '*'}"
+    return node
 
 
 @dataclass
 class Change:
     """Represents a detected change in a model."""
-    source_file: str
-    component_id: str
+    artefact: str
+    element: str
     attribute: str
     old_value: Any
     new_value: Any
+    kind: ChangeKind = ChangeKind.MODIFIED
     change_hash: str = ""
-    
+
     def __post_init__(self):
         """Generate change hash for tracking."""
-        change_str = f"{self.component_id}:{self.attribute}:{self.old_value}:{self.new_value}"
-        self.change_hash = hashlib.md5(change_str.encode()).hexdigest()[:8]
+        change_str = f"{self.artefact}:{self.element}:{self.attribute}:{self.old_value}:{self.new_value}"
+        self.change_hash = hashlib.sha256(change_str.encode()).hexdigest()[:8]
+
+    @property
+    def node(self) -> str:
+        return node_id(self.artefact, self.element, self.attribute)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "artefact": self.artefact, "element": self.element, "attribute": self.attribute,
+            "kind": self.kind.value, "old_value": self.old_value, "new_value": self.new_value,
+            "hash": self.change_hash,
+        }
 
 
 @dataclass
-class ImpactedElement:
-    """Represents an element impacted by a change."""
-    model_file: str
-    element_id: str
+class Update:
+    """One reconciliation step computed by the PropagationEngine."""
+    artefact: str
+    element: str
     attribute: str
     old_value: Any
     new_value: Any
-    granularity: GranularityLevel
+    reason: str
+    granularity: GranularityLevel = GranularityLevel.ELEMENT
+    structural: bool = False
+    applied: bool = False
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "artefact": self.artefact, "element": self.element, "attribute": self.attribute,
+            "old_value": self.old_value, "new_value": self.new_value, "reason": self.reason,
+            "granularity": self.granularity.value, "structural": self.structural, "applied": self.applied,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Change detection
+# ---------------------------------------------------------------------------
 
 class ChangeDetector:
-    """Detects changes between model versions."""
-    
+    """Detects changes between two snapshots of the artefact set."""
+
+    def detect(self, old: Snapshot, new: Snapshot) -> List[Change]:
+        return (
+            self.detect_catalogue_changes(old, new)
+            + self.detect_bom_changes(old.bom, new.bom)
+            + self.detect_network_changes(old.network, new.network)
+            + self.detect_requirement_changes(old.requirements, new.requirements)
+        )
+
     @staticmethod
-    def detect_owl_changes(catalogue_v1: str, catalogue_v2: str) -> List[Change]:
-        """
-        Detect changes in OWL ontology files.
-        
-        Args:
-            catalogue_v1: Path to baseline catalogue
-            catalogue_v2: Path to updated catalogue
-            
-        Returns:
-            List of detected changes
-        """
+    def _diff_keyed(artefact: str, old: Dict[str, Dict], new: Dict[str, Dict], attributes: List[str]) -> List[Change]:
         changes = []
-        
-        try:
-            tree_v1 = ET.parse(catalogue_v1)
-            tree_v2 = ET.parse(catalogue_v2)
-            
-            root_v1 = tree_v1.getroot()
-            root_v2 = tree_v2.getroot()
-            
-            # Register namespaces
-            namespaces = {
-                'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
-                'owl': 'http://www.w3.org/2002/07/owl#',
-                'vim4': 'http://bipm.org/jcgm/vim4#',
-            }
-            
-            for prefix, uri in namespaces.items():
-                ET.register_namespace(prefix, uri)
-            
-            # Find all quantity values (mass values in this case)
-            quantity_values_v1 = ChangeDetector._extract_quantity_values(root_v1, namespaces)
-            quantity_values_v2 = ChangeDetector._extract_quantity_values(root_v2, namespaces)
-            
-            # Compare quantities
-            for comp_id, (attr, value_v1) in quantity_values_v1.items():
-                if comp_id in quantity_values_v2:
-                    attr_v2, value_v2 = quantity_values_v2[comp_id]
-                    if value_v1 != value_v2:
-                        change = Change(
-                            source_file="catalogue.owl",
-                            component_id=comp_id,
-                            attribute=attr,
-                            old_value=value_v1,
-                            new_value=value_v2
-                        )
-                        changes.append(change)
-        
-        except ET.ParseError as e:
-            print(f"Error parsing OWL file: {e}")
-        
+        for key in old.keys() - new.keys():
+            changes.append(Change(artefact, key, "", old[key], None, ChangeKind.REMOVED))
+        for key in new.keys() - old.keys():
+            changes.append(Change(artefact, key, "", None, new[key], ChangeKind.ADDED))
+        for key in old.keys() & new.keys():
+            for attr in attributes:
+                if old[key].get(attr) != new[key].get(attr):
+                    changes.append(Change(artefact, key, attr, old[key].get(attr), new[key].get(attr)))
+        return sorted(changes, key=lambda c: (c.element, c.attribute))
+
+    def detect_catalogue_changes(self, old: Snapshot, new: Snapshot) -> List[Change]:
+        def as_dict(catalogue):
+            return {cid: {"mass": p.mass_kg, "class": p.part_class} for cid, p in catalogue.items()}
+        return self._diff_keyed(CATALOGUE, as_dict(old.catalogue), as_dict(new.catalogue), ["mass", "class"])
+
+    def detect_bom_changes(self, old: Dict[str, Any], new: Dict[str, Any]) -> List[Change]:
+        def as_dict(bom):
+            # Duplicate entries for one type are merged so that diffs stay per component type.
+            merged: Dict[str, Dict] = {}
+            for c in bom.get("components", []):
+                entry = merged.setdefault(c["type"], {"quantity": 0, "mass_kg_per_unit": c["mass_kg_per_unit"]})
+                entry["quantity"] += c["quantity"]
+            return merged
+        changes = self._diff_keyed(BOM, as_dict(old), as_dict(new), ["quantity", "mass_kg_per_unit"])
+        if old.get(TOTAL) != new.get(TOTAL):
+            changes.append(Change(BOM, "total_system", TOTAL, old.get(TOTAL), new.get(TOTAL)))
         return changes
-    
-    @staticmethod
-    def _extract_quantity_values(root: ET.Element, namespaces: Dict) -> Dict[str, Tuple[str, float]]:
-        """Extract quantity values from OWL root element."""
-        quantities = {}
-        
-        # Find all named individuals with mass values
-        for individual in root.findall('.//owl:NamedIndividual', namespaces):
-            about = individual.get('{http://www.w3.org/1999/02/22-rdf-syntax-ns#}about', '')
-            
-            # Extract component ID
-            comp_id = None
-            comp_id_elem = individual.find('componentID')
-            if comp_id_elem is not None:
-                comp_id = comp_id_elem.text
-            
-            # Look for mass values
-            for value_elem in individual.findall('vim4:hasDoubleNumber', namespaces):
-                if comp_id:
-                    value = float(value_elem.text)
-                    quantities[comp_id] = ("mass", value)
-        
-        return quantities
-    
-    @staticmethod
-    def detect_json_changes(bom_v1: str, bom_v2: str) -> List[Change]:
-        """
-        Detect changes in JSON Bill of Materials.
-        
-        Args:
-            bom_v1: Path to baseline BOM
-            bom_v2: Path to updated BOM
-            
-        Returns:
-            List of detected changes
-        """
-        changes = []
-        
-        try:
-            with open(bom_v1, 'r') as f:
-                data_v1 = json.load(f)
-            with open(bom_v2, 'r') as f:
-                data_v2 = json.load(f)
-            
-            # Create component lookup
-            comp_v1 = {c['type']: c for c in data_v1.get('components', [])}
-            comp_v2 = {c['type']: c for c in data_v2.get('components', [])}
-            
-            # Compare component masses
-            for comp_id, comp_v1_data in comp_v1.items():
-                if comp_id in comp_v2:
-                    comp_v2_data = comp_v2[comp_id]
-                    
-                    for key in ['mass_kg_per_unit', 'quantity']:
-                        if comp_v1_data.get(key) != comp_v2_data.get(key):
-                            change = Change(
-                                source_file="bom.json",
-                                component_id=comp_id,
-                                attribute=key,
-                                old_value=comp_v1_data.get(key),
-                                new_value=comp_v2_data.get(key)
-                            )
-                            changes.append(change)
-        
-        except (json.JSONDecodeError, IOError) as e:
-            print(f"Error reading JSON file: {e}")
-        
+
+    def detect_network_changes(self, old: Dict[str, Any], new: Dict[str, Any]) -> List[Change]:
+        old_nodes = {n["component_id"]: n for n in old.get("nodes", [])}
+        new_nodes = {n["component_id"]: n for n in new.get("nodes", [])}
+        changes = self._diff_keyed(NETWORK, old_nodes, new_nodes, ["type", "role"])
+
+        # A removed and an added node with the same type and role is reported as a rename.
+        removed = [c for c in changes if c.kind == ChangeKind.REMOVED]
+        added = [c for c in changes if c.kind == ChangeKind.ADDED]
+        for r in removed:
+            match = next((a for a in added if (a.new_value["type"], a.new_value["role"]) ==
+                          (r.old_value["type"], r.old_value["role"])), None)
+            if match:
+                added.remove(match)
+                changes.remove(r)
+                changes.remove(match)
+                changes.append(Change(NETWORK, match.element, "component_id", r.element, match.element))
+
+        def links(network):
+            return {f"{l['source']}->{l['target']}": l for l in network.get("links", [])}
+        changes += self._diff_keyed(NETWORK, links(old), links(new), ["type", "protocol"])
         return changes
+
+    def detect_requirement_changes(self, old: List[Dict[str, str]], new: List[Dict[str, str]]) -> List[Change]:
+        return self._diff_keyed(
+            REQUIREMENTS,
+            {r["RequirementID"]: r for r in old},
+            {r["RequirementID"]: r for r in new},
+            ["Description", "Parameter", "Operator", "Value", "Unit"],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Impact analysis
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ImpactGraph:
+    """Directed graph of impacted elements; composable across changes."""
+    nodes: Dict[str, Set[str]] = field(default_factory=dict)        # node -> hashes of changes reaching it
+    edges: Set[Tuple[str, str, str]] = field(default_factory=set)   # (from, to, relation)
+    roots: Dict[str, str] = field(default_factory=dict)             # change hash -> root node
+
+    def add_edge(self, source: str, target: str, relation: str):
+        self.edges.add((source, target, relation))
+
+    def merge(self, other: "ImpactGraph") -> "ImpactGraph":
+        for node, causes in other.nodes.items():
+            self.nodes.setdefault(node, set()).update(causes)
+        self.edges |= other.edges
+        self.roots.update(other.roots)
+        return self
+
+    def successors(self, node: str) -> List[Tuple[str, str]]:
+        return sorted((t, rel) for s, t, rel in self.edges if s == node)
+
+    def paths_from(self, root: str) -> List[List[str]]:
+        """All maximal propagation paths starting at root (for deep inspection)."""
+        paths, stack = [], [[root]]
+        while stack:
+            path = stack.pop()
+            nexts = [t for t, _ in self.successors(path[-1]) if t not in path]
+            if not nexts:
+                paths.append(path)
+            stack += [path + [t] for t in nexts]
+        return sorted(paths)
+
+    def coarsened(self, granularity: GranularityLevel) -> "ImpactGraph":
+        graph = ImpactGraph(roots={h: coarsen(n, granularity) for h, n in self.roots.items()})
+        for node, causes in self.nodes.items():
+            graph.nodes.setdefault(coarsen(node, granularity), set()).update(causes)
+        for s, t, rel in self.edges:
+            cs, ct = coarsen(s, granularity), coarsen(t, granularity)
+            if cs != ct:
+                graph.add_edge(cs, ct, rel)
+        return graph
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "roots": self.roots,
+            "nodes": {n: sorted(c) for n, c in sorted(self.nodes.items())},
+            "edges": [{"from": s, "to": t, "type": rel} for s, t, rel in sorted(self.edges)],
+        }
 
 
 class ImpactAnalyzer:
-    """Analyzes impact of detected changes across models."""
-    
-    def __init__(self, bom_file: str, requirements_file: str, report_file: str):
-        """Initialize impact analyzer with model references."""
-        self.bom_file = bom_file
-        self.requirements_file = requirements_file
-        self.report_file = report_file
-        self.impacted_elements: List[ImpactedElement] = []
-    
-    def analyze_impact(self, changes: List[Change], granularity: GranularityLevel = GranularityLevel.ELEMENT) -> List[ImpactedElement]:
-        """
-        Analyze impact of changes across dependent models.
-        
-        Args:
-            changes: List of detected changes
-            granularity: Level of granularity for impact analysis
-            
-        Returns:
-            List of impacted elements
-        """
-        self.impacted_elements = []
-        
+    """Traces changes through the traceability rules of a (target) snapshot."""
+
+    def __init__(self, snapshot: Snapshot):
+        self.snapshot = snapshot
+        self.bom_types = {c["type"] for c in snapshot.bom.get("components", [])}
+        self.requirements_by_param: Dict[str, List[str]] = {}
+        for req in snapshot.requirements:
+            self.requirements_by_param.setdefault(req["Parameter"], []).append(req["RequirementID"])
+
+    def _direct_impacts(self, node: str, change: Optional[Change] = None) -> List[Tuple[str, str]]:
+        parts = node.split(":")
+        artefact = parts[0]
+        element = parts[1] if len(parts) > 1 else ""
+        attribute = parts[2] if len(parts) > 2 else ""
+        impacts: List[Tuple[str, str]] = []
+
+        if artefact == CATALOGUE and attribute in ("mass", "") and element in self.bom_types:
+            impacts.append((node_id(BOM, element, "mass_kg_per_unit"), "direct_update"))
+
+        elif artefact == NETWORK:
+            impacts.append((NETWORK_XML, "representation_sync"))
+            node_types = set()
+            for value in (change.old_value, change.new_value) if change else ():
+                if isinstance(value, dict) and "component_id" in value:
+                    node_types.add(value["type"])
+            if change and change.attribute == "type" and "->" not in element:
+                node_types |= {change.old_value, change.new_value}
+            for node_type in sorted(node_types):
+                impacts.append((node_id(BOM, node_type, "quantity"), "view_to_source"))
+
+        elif artefact == BOM and element != "total_system":
+            impacts.append((node_id(BOM, "total_system", TOTAL), "derived_computation"))
+            impacts.append((BOM_XML, "representation_sync"))
+
+        elif artefact == BOM and element == "total_system":
+            impacts.append((BOM_XML, "representation_sync"))
+            for req_id in self.requirements_by_param.get(attribute, []):
+                impacts.append((node_id(REPORT, req_id, "status"), "requirement_verification"))
+
+        elif artefact == REQUIREMENTS:
+            impacts.append((node_id(REPORT, element, "status"), "requirement_verification"))
+
+        return impacts
+
+    def analyze(self, changes: List[Change]) -> ImpactGraph:
+        """Build one impact graph per change and compose them into a single graph."""
+        graph = ImpactGraph()
         for change in changes:
-            if change.source_file == "catalogue.owl" and change.component_id == "T001":
-                # T001 mass change propagates to BOM
-                self.impacted_elements.append(ImpactedElement(
-                    model_file="bom.json",
-                    element_id=change.component_id,
-                    attribute="mass_kg_per_unit",
-                    old_value=change.old_value,
-                    new_value=change.new_value,
-                    granularity=granularity
-                ))
-                
-                # Impacts calculated total mass
-                self.impacted_elements.append(ImpactedElement(
-                    model_file="bom.json",
-                    element_id="total_system",
-                    attribute="calculated_total_mass_kg",
-                    old_value=None,  # Will be computed
-                    new_value=None,  # Will be computed
-                    granularity=GranularityLevel.MODEL
-                ))
-                
-                # Impacts report (requirement verification)
-                self.impacted_elements.append(ImpactedElement(
-                    model_file="report.md",
-                    element_id="REQ001",
-                    attribute="status",
-                    old_value=None,
-                    new_value=None,
-                    granularity=GranularityLevel.MODEL
-                ))
-        
-        return self.impacted_elements
-    
-    def build_impact_structure(self) -> Dict[str, List[str]]:
-        """
-        Build an explicit structure (graph/tree) representing impacted elements.
-        
-        Returns:
-            Dictionary representing dependency graph
-        """
-        impact_graph = {
-            "source": {"model": "catalogue.owl", "element": "T001", "attribute": "mass"},
-            "propagation_chain": [
-                {
-                    "step": 1,
-                    "from": "catalogue.owl:T001:mass",
-                    "to": "bom.json:T001:mass_kg_per_unit",
-                    "type": "direct_update Og lalalala"
-                },
-                {
-                    "step": 2,
-                    "from": "bom.json:T001:mass_kg_per_unit",
-                    "to": "bom.json:total_system:calculated_total_mass_kg",
-                    "type": "derived_computatio nøa nøanøn n"
-                },
-                {
-                    "step": 3,
-                    "from": "bom.json:total_system:calculated_total_mass_kg",
-                    "to": "report.md:REQ001:status",
-                    "type": "requirement_verification koo kokoko kokokoko"
-                }
-            ],
-            "impacted_elements": [elem.__dict__ for elem in self.impacted_elements]
+            graph.merge(self.analyze_change(change))
+        return graph
+
+    def analyze_change(self, change: Change) -> ImpactGraph:
+        graph = ImpactGraph(roots={change.change_hash: change.node})
+        queue = deque([change.node])
+        graph.nodes[change.node] = {change.change_hash}
+        while queue:
+            current = queue.popleft()
+            for target, relation in self._direct_impacts(current, change if current == change.node else None):
+                graph.add_edge(current, target, relation)
+                if target not in graph.nodes:
+                    graph.nodes[target] = set()
+                    queue.append(target)
+                graph.nodes[target].add(change.change_hash)
+        return graph
+
+
+# ---------------------------------------------------------------------------
+# Propagation / reconciliation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PropagationResult:
+    strategy: PropagationStrategy
+    updates: List[Update]
+    bom: Dict[str, Any]
+    contents: Dict[str, str]                     # relative path -> rendered text for applied artefacts
+    verification: List[Dict[str, Any]]
+    errors: List[str] = field(default_factory=list)
+
+    @property
+    def consistent(self) -> bool:
+        return not self.updates and not self.errors
+
+    @property
+    def pending(self) -> List[Update]:
+        return [u for u in self.updates if not u.applied]
+
+    @property
+    def all_satisfied(self) -> bool:
+        return all(v["satisfied"] for v in self.verification)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "strategy": self.strategy.value,
+            "consistent": self.consistent,
+            "updates": [u.to_dict() for u in self.updates],
+            "errors": self.errors,
+            "verification": self.verification,
+            "all_satisfied": self.all_satisfied,
         }
-        
-        return impact_graph
 
 
 class PropagationEngine:
-    """Executes change propagation according to specified strategy."""
-    
+    """Reconciles a snapshot with its source artefacts according to a strategy."""
+
     def __init__(self, strategy: PropagationStrategy = PropagationStrategy.SEMI_AUTOMATIC):
         """Initialize with propagation strategy."""
         self.strategy = strategy
-        self.propagation_log = []
-    
-    def propagate_changes(self, changes: List[Change], bom_data: Dict, requirements_data: List[Dict]) -> Tuple[Dict, List[Dict], bool]:
-        """
-        Propagate changes to dependent models.
-        
-        Args:
-            changes: List of detected changes
-            bom_data: Current BOM data
-            requirements_data: Current requirements data
-            
-        Returns:
-            Tuple of (updated_bom, updated_requirements, all_satisfied)
-        """
-        updated_bom = bom_data.copy()
-        updated_bom['components'] = [c.copy() for c in bom_data.get('components', [])]
-        
-        for change in changes:
-            if change.component_id == "T001" and change.attribute == "mass":
-                # Update BOM component
-                for component in updated_bom['components']:
-                    if component.get('type') == 'T001':
-                        self.propagation_log.append({
-                            'action': 'update',
-                            'model': 'bom.json',
-                            'component': 'T001',
-                            'old_value': component.get('mass_kg_per_unit'),
-                            'new_value': change.new_value
-                        })
-                        component['mass_kg_per_unit'] = change.new_value
-        
-        # Recalculate total mass
-        total_mass = sum(
-            c.get('quantity', 1) * c.get('mass_kg_per_unit', 0)
-            for c in updated_bom['components']
-        )
-        
-        self.propagation_log.append({
-            'action': 'recalculate',
-            'model': 'bom.json',
-            'attribute': 'calculated_total_mass_kg',
-            'old_value': bom_data.get('calculated_total_mass_kg'),
-            'new_value': total_mass
-        })
-        
-        updated_bom['calculated_total_mass_kg'] = total_mass
-        
-        # Verify requirements
-        all_satisfied = True
-        for req in requirements_data:
-            param = req.get('Parameter', '')
-            operator = req.get('Operator', '')
-            threshold = float(req.get('Value', 0))
-            
-            if param == 'calculated_total_mass_kg':
-                actual = updated_bom['calculated_total_mass_kg']
-                satisfied = self._evaluate_constraint(actual, operator, threshold)
-                
-                self.propagation_log.append({
-                    'action': 'verify',
-                    'requirement': req.get('RequirementID'),
-                    'satisfied': satisfied,
-                    'actual_value': actual,
-                    'threshold': threshold
-                })
-                
-                all_satisfied = all_satisfied and satisfied
-        
-        return updated_bom, requirements_data, all_satisfied
-    
-    @staticmethod
-    def _evaluate_constraint(actual: float, operator: str, threshold: float) -> bool:
-        """Evaluate a constraint against actual value."""
-        if operator == "<=":
-            return actual <= threshold
-        elif operator == ">=":
-            return actual >= threshold
-        elif operator == "<":
-            return actual < threshold
-        elif operator == ">":
-            return actual > threshold
-        elif operator == "==":
-            return actual == threshold
-        else:
-            return False
 
+    def _performs(self, structural: bool) -> bool:
+        """Whether an update is carried out in memory (MANUAL simulates everything as a preview)."""
+        return not (self.strategy == PropagationStrategy.SEMI_AUTOMATIC and structural)
 
-if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) < 3:
-        print("Usage: python mt1_change_impact.py <v1_catalogue> <v2_catalogue>")
-        sys.exit(1)
-    
-    catalogue_v1 = sys.argv[1]
-    catalogue_v2 = sys.argv[2]
-    
-    # Detect changes
-    print("="*70)
-    print("MT.1 -- Change Impact & Reconciliation")
-    print("="*70)
-    
-    detector = ChangeDetector()
-    changes = detector.detect_owl_changes(catalogue_v1, catalogue_v2)
-    
-    print(f"\n1. CHANGE DETECTION")
-    print(f"   Detected {len(changes)} change(s):")
-    for change in changes:
-        print(f"   - {change.component_id}.{change.attribute}: {change.old_value} → {change.new_value} (hash: {change.change_hash})")
-    
-    # Analyze impact
-    print(f"\n2. IMPACT ANALYSIS")
-    analyzer = ImpactAnalyzer("bom.json", "requirements.csv", "report.md")
-    impacted = analyzer.analyze_impact(changes, GranularityLevel.ELEMENT)
-    print(f"   Identified {len(impacted)} impacted element(s):")
-    for elem in impacted:
-        print(f"   - {elem.model_file}:{elem.element_id}:{elem.attribute}")
-    
-    # Build impact structure
-    impact_graph = analyzer.build_impact_structure()
-    print(f"\n3. IMPACT STRUCTURE (Dependency Graph)")
-    print(f"   Source: {impact_graph['source']['model']}:{impact_graph['source']['element']}:{impact_graph['source']['attribute']}")
-    print(f"   Propagation chain ({len(impact_graph['propagation_chain'])} steps):")
-    for step in impact_graph['propagation_chain']:
-        print(f"     Step {step['step']}: {step['from']} → {step['to']} ({step['type']})")
+    def reconcile(self, snapshot: Snapshot, baseline: Optional[Snapshot] = None) -> PropagationResult:
+        """
+        Compute (and, depending on the strategy, apply) every update needed so that
+        derived artefacts agree with the source artefacts of the snapshot.
+
+        A baseline snapshot lets the engine notice component types that disappeared
+        from the communications view entirely, so they can be removed from the BOM.
+        """
+        updates: List[Update] = []
+        errors: List[str] = []
+        bom = A.clone_bom(snapshot.bom)
+
+        def record(update: Update) -> bool:
+            performed = self._performs(update.structural)
+            update.applied = performed and self.strategy != PropagationStrategy.MANUAL
+            updates.append(update)
+            return performed
+
+        # 1. Communications view -> BOM structure (quantities of comms components).
+        node_counts = Counter(n["type"] for n in snapshot.network.get("nodes", []))
+        comms_types = set(node_counts)
+        if baseline is not None:
+            comms_types |= {n["type"] for n in baseline.network.get("nodes", [])}
+
+        components: List[Dict[str, Any]] = []
+        seen: Dict[str, Dict[str, Any]] = {}
+        for comp in bom.get("components", []):
+            if comp["type"] in seen:
+                kept = seen[comp["type"]]
+                if record(Update(BOM, comp["type"], "entry", "duplicate entry", "merged",
+                                 "duplicate BOM entries for one component type", structural=True)):
+                    kept["quantity"] += comp["quantity"]
+                    continue
+            else:
+                seen[comp["type"]] = comp
+            components.append(comp)
+
+        for comp_type in sorted(comms_types):
+            expected = node_counts.get(comp_type, 0)
+            comp = seen.get(comp_type)
+            if comp is None and expected:
+                part = snapshot.catalogue.get(comp_type)
+                if part is None or part.mass_kg is None:
+                    errors.append(f"{comp_type} is used in {NETWORK} but has no mass in {CATALOGUE}")
+                    continue
+                new_comp = {"type": comp_type, "quantity": expected, "mass_kg_per_unit": part.mass_kg}
+                if record(Update(BOM, comp_type, "entry", None, new_comp,
+                                 f"{NETWORK} has {expected} node(s) of type {comp_type}", structural=True)):
+                    components.append(new_comp)
+                    seen[comp_type] = new_comp
+            elif comp is not None and comp["quantity"] != expected:
+                if expected == 0:
+                    if record(Update(BOM, comp_type, "entry", comp, None,
+                                     f"{comp_type} no longer used in {NETWORK}", structural=True)):
+                        components.remove(comp)
+                        del seen[comp_type]
+                elif record(Update(BOM, comp_type, "quantity", comp["quantity"], expected,
+                                   f"{NETWORK} has {expected} node(s) of type {comp_type}", structural=True)):
+                    comp["quantity"] = expected
+        bom["components"] = components
+
+        # 2. Catalogue -> BOM unit masses.
+        for comp in components:
+            part = snapshot.catalogue.get(comp["type"])
+            if part is None or part.mass_kg is None:
+                errors.append(f"BOM component {comp['type']} has no mass in {CATALOGUE}")
+                continue
+            if comp["mass_kg_per_unit"] != part.mass_kg:
+                if record(Update(BOM, comp["type"], "mass_kg_per_unit", comp["mass_kg_per_unit"], part.mass_kg,
+                                 f"{CATALOGUE}:{comp['type']}:mass")):
+                    comp["mass_kg_per_unit"] = part.mass_kg
+
+        # 3. Derived total mass.
+        total = A.compute_total_mass(bom)
+        if bom.get(TOTAL) != total:
+            if record(Update(BOM, "total_system", TOTAL, bom.get(TOTAL), total,
+                             "sum of quantity x mass_kg_per_unit", GranularityLevel.FEATURE)):
+                bom[TOTAL] = total
+
+        contents: Dict[str, str] = {}
+        if any(u.artefact == BOM and self._performs(u.structural) for u in updates):
+            contents[A.BOM_JSON] = A.dump_bom_json(bom)
+
+        # 4. Representations: bom.xml and comm-network.xml mirror their JSON source.
+        bom_xml = A.render_bom_xml(bom)
+        if snapshot.bom_xml_text is None or not A.bom_equivalent(A.parse_bom_xml(snapshot.bom_xml_text), bom):
+            if record(Update(BOM_XML, "root", "", "out of sync", "regenerated from bom.json",
+                             "representation of bom.json", GranularityLevel.MODEL)):
+                contents[A.BOM_XML] = bom_xml
+
+        network_xml = A.render_network_xml(snapshot.network)
+        if snapshot.network_xml_text is None or A.parse_network_xml(snapshot.network_xml_text) != snapshot.network:
+            if record(Update(NETWORK_XML, "root", "", "out of sync", "regenerated from comm-network.json",
+                             "representation of comm-network.json", GranularityLevel.MODEL)):
+                contents[A.NETWORK_XML] = network_xml
+
+        # 5. Requirements x BOM -> report.
+        verification = A.evaluate_requirements(snapshot.requirements, bom)
+        for v in verification:
+            if v["satisfied"] is None:
+                errors.append(f"{v['requirement']}: parameter {v['parameter']} not found in {BOM}")
+        report = A.render_report(snapshot.requirements, bom)
+        if snapshot.report_text != report:
+            if record(Update(REPORT, "root", "", "out of date", "regenerated",
+                             "requirements.csv evaluated against bom.json", GranularityLevel.MODEL)):
+                contents[A.REPORT] = report
+
+        return PropagationResult(self.strategy, updates, bom, contents, verification, errors)
+
+    def apply(self, snapshot: Snapshot, result: PropagationResult) -> List[str]:
+        """Write the applied artefacts to disk; returns the files that changed."""
+        if self.strategy == PropagationStrategy.MANUAL:
+            return []
+        return A.write_artefacts(snapshot.root, result.contents)
