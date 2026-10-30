@@ -29,12 +29,7 @@
       "type": "ANT002",
       "quantity": 1,
       "mass_kg_per_unit": 15.0
-    },
-    {
-      "type": "ANT002",
-      "quantity": 1,
-      "mass_kg_per_unit": 1500.0
     }
   ],
-  "calculated_total_mass_kg": 37200.0
+  "calculated_total_mass_kg": 357.0
 }
