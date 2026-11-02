@@ -80,6 +80,8 @@ v2/
 
 `tools/` contains a reference implementation of MT.1 (change detection, impact analysis and propagation); see [tools/README.md](tools/README.md). GitHub Actions run its tests on every push and pull request, and check that the derived artefacts (BOM total, XML mirrors and report) agree with their sources. On `main`, a second workflow propagates changes to source artefacts and opens a pull request with the regenerated artefacts.
 
+`femm/` contains *Femm*, an event-driven federated realisation of the same tasks. Each artefact is owned by an agent that publishes change events. A planning service turns these events into commands, which the owners approve or reject. The package includes an in-memory realisation for experiments and a Git realisation in which the planner's commands are pull requests; see [femm/README.md](femm/README.md). Try `python3 -m femm scenario all` or `python3 -m femm demo-git`.
+
 ### Model Management Scenarios
 
 We define three Engineering Scenarios (ES) that are encountered during the design of the hypothetical satellite system.

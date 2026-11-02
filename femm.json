@@ -1,0 +1,12 @@
+{
+  "module": "femm.satellite",
+  "root": "v2",
+  "main": "main",
+  "owners": {
+    "manufacturer": ["@adrianrutle"],
+    "communications_engineer": ["@adrianrutle"],
+    "requirements_engineer": ["@adrianrutle"],
+    "systems_engineer": ["@adrianrutle"],
+    "verification_engineer": ["@adrianrutle"]
+  }
+}
