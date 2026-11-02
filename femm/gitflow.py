@@ -177,8 +177,16 @@ class GitHubForge(Forge):
         self.remote, self.main = remote, main
         self.main_ref = f"{remote}/{main}"
         self._label = False
+        # Always address the repository behind this remote (never e.g. an upstream fork parent).
+        url = git.run("remote", "get-url", remote)
+        match = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", url)
+        if not match:
+            raise RuntimeError(f"remote {remote} is not a GitHub repository: {url}")
+        self.repository = match.group(1)
 
     def gh(self, *args: str) -> str:
+        if args[0] in ("pr", "label"):
+            args = (args[0], args[1], "--repo", self.repository) + args[2:]
         result = subprocess.run(["gh", *args], cwd=self.git.repo, capture_output=True, text=True, check=False)
         if result.returncode != 0:
             raise RuntimeError(f"gh {' '.join(args)}: {result.stderr.strip()}")
