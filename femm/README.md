@@ -33,18 +33,20 @@ A Restate realisation is planned.
 | `runtime.py` | `System`: wires one MSA per artefact and the services onto a bus |
 | `satellite.py` | The MoM 2026 satellite federation. It uses the loaders and renderers in `tools/artefacts.py` as adapters |
 | `gitflow.py` | Git realisation, described below |
+| `replay.py`, `replay.html` | Records the scenarios and writes a self-contained HTML page that replays them step by step, for demonstrations |
 | `tests/` | Protocol properties on random schedules, scenarios ES.1–ES.3, and the Git realisation on throw-away repositories |
 
 ## Try it
 
 ```bash
-python3 -m unittest discover -s femm/tests -t .      # 29 tests
+python3 -m unittest discover -s femm/tests -t .      # 32 tests
 python3 -m femm scenario es1                         # message trace of ES.1
 python3 -m femm scenario all --shuffle --seed 3 --duplicates 5
 python3 -m femm scenario es2 --reject                # the owner rejects the backup antenna
 python3 -m femm scenario es3                         # concurrent edits of the network
 python3 -m femm check v2                             # consistency and requirement results
 python3 -m femm demo-git                             # ES.1 + ES.2 on a throw-away Git repository
+python3 -m femm replay                               # femm-replay.html: step-by-step replay of the scenarios
 ```
 
 ## Protocol properties, tested

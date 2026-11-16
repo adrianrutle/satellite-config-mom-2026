@@ -3,6 +3,7 @@ Command line interface.
 
     python3 -m femm scenario es1|es2|es3|all [--shuffle] [--seed N] [--duplicates K] [--reject]
     python3 -m femm check DIR
+    python3 -m femm replay [--out FILE] [--json FILE]
     python3 -m femm git ...              (Git realisation, see femm/gitflow.py)
 """
 
@@ -122,6 +123,22 @@ def demo_git(args) -> int:
     return 0 if same else 1
 
 
+def replay(args) -> int:
+    """Record the scenarios and write the replay page (femm/replay.py)."""
+    from . import replay as R
+
+    data = R.trace()
+    Path(args.out).write_text(R.page(data))
+    if args.json:
+        Path(args.json).write_text(json.dumps(data, indent=1, default=str))
+    for s in data["scenarios"]:
+        summary = s["summary"]
+        print(f"{s['key']:<7} {len(s['frames']):>3} steps, {summary['messages']} messages, "
+              f"{summary['deliveries']} deliveries, lost updates: {summary['lost']}")
+    print(f"replay page written to {args.out}")
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python3 -m femm")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -139,6 +156,10 @@ def main(argv=None) -> int:
     p = sub.add_parser("demo-git", help="run ES.1 and ES.2 on a throw-away Git repository")
     p.add_argument("--dir", help="where to create the repository (must not exist)")
     p.set_defaults(func=demo_git)
+    p = sub.add_parser("replay", help="write an HTML page that replays the scenarios step by step")
+    p.add_argument("--out", default="femm-replay.html", help="where to write the page (default: femm-replay.html)")
+    p.add_argument("--json", metavar="FILE", help="also write the recorded trace as JSON")
+    p.set_defaults(func=replay)
     sub.add_parser("git", help="Git realisation: python3 -m femm git --help")
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["git"]:
