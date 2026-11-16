@@ -1,0 +1,78 @@
+name: Femm planner
+
+# Git realisation of the Femm protocol (see femm/gitflow.py):
+#   push to main changing an artefact  -> event
+#   pull request opened by the planner -> command (merged at once if the owner's policy allows it)
+#   merging / closing it               -> approval / rejection by the owner
+#   femm/* pull requests are checked against the current version of their target (no lost updates).
+#
+# Off by default: set the repository variable FEMM_ENABLED=true to run it on every push
+# (this also switches off propagate.yml), or start it by hand (workflow_dispatch).
+#
+# Pull requests opened or merged with the default GITHUB_TOKEN do not trigger other workflows.
+# The planner therefore continues automatically merged steps in the same run. To get the
+# femm/base-version check on its own pull requests, store a token with contents and
+# pull-request write access as the secret FEMM_TOKEN.
+
+on:
+  push:
+    branches: [main]
+    paths: ["v2/**", "femm.json"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      before:
+        description: "Commit to compare against (default: the parent of main)"
+        required: false
+
+jobs:
+  plan:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && vars.FEMM_ENABLED == 'true')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: femm-planner      # A2: one planner run at a time; a dropped pending run loses
+      cancel-in-progress: false  # nothing, since the planner resumes from refs/femm/processed
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.FEMM_TOKEN || github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.FEMM_TOKEN || github.token }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Configure Git
+        run: |
+          git config user.name "femm-planner"
+          git config user.email "femm-planner@users.noreply.github.com"
+      - name: Plan and propose commands
+        run: |
+          python -m femm git --forge github on-push \
+            --before "${{ inputs.before || github.event.before }}" \
+            --after "$(git rev-parse HEAD)" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+  base-version:
+    name: femm/base-version
+    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'femm/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Target unchanged since the command was computed
+        run: |
+          git fetch -q origin "${{ github.head_ref }}"
+          python -m femm git --forge github check-pr --head "${{ github.event.pull_request.head.sha }}"

@@ -28,6 +28,8 @@ concurrency:
 
 jobs:
   propagate:
+    # Replaced by the Femm planner (femm.yml) when the repository variable FEMM_ENABLED is true.
+    if: vars.FEMM_ENABLED != 'true'
     runs-on: ubuntu-latest
     env:
       STRATEGY: ${{ inputs.strategy || 'automatic' }}

@@ -24,6 +24,13 @@ jobs:
       - name: Run tests
         working-directory: tools
         run: python -m unittest -v test_mt1
+      - name: Run Femm tests
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.com"
+          python -m unittest discover -v -s femm/tests -t .
+      - name: Femm consistency of v2
+        run: python -m femm check v2
 
   consistency:
     name: Artefact consistency
